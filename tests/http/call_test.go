@@ -153,6 +153,69 @@ func TestNewCallObservableWith404MadeTransientDoesRetry(t *testing.T) {
 	}
 }
 
+// ── NewCall / DoWithRetry ──────────────────────────────────────────────────────
+
+func TestNewCallDoWithRetryReturnsResponseOnSuccess(t *testing.T) {
+	t.Parallel()
+	env, err := kawa.NewCall[kawa.NoReq, getUserEnvV1Res](newTestHTTPClient(), kawa.Get, getUserTS.URL).
+		WithMaxRetries(0).
+		DoWithRetry(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DoWithRetry: unexpected error: %v", err)
+	}
+	if !cmp.Equal(userEnvRes, env.Body) {
+		t.Error(cmp.Diff(userEnvRes, env.Body))
+	}
+}
+
+func TestNewCallDoWithRetryRetriesTransientErrorsThenSucceeds(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope{"user": userRes})
+	}))
+	defer ts.Close()
+
+	env, err := kawa.NewCall[kawa.NoReq, getUserEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
+		WithRetryPolicy(zeroBackOffPolicy{n: 3}).
+		DoWithRetry(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DoWithRetry: unexpected error after retries: %v", err)
+	}
+	if !cmp.Equal(userEnvRes, env.Body) {
+		t.Error(cmp.Diff(userEnvRes, env.Body))
+	}
+	if got := int(attempts.Load()); got != 3 {
+		t.Errorf("expected 3 attempts, got %d", got)
+	}
+}
+
+func TestNewCallDoWithRetryDoesNotRetryPermanent404(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	_, err := kawa.NewCall[kawa.NoReq, getUserEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
+		WithRetryPolicy(zeroBackOffPolicy{n: 5}).
+		DoWithRetry(context.Background(), nil)
+	if err == nil {
+		t.Fatal("expected error for 404 response, got nil")
+	}
+	if got := int(attempts.Load()); got != 1 {
+		t.Errorf("expected 1 attempt (permanent error), got %d", got)
+	}
+}
+
 // ── Deadline with testing/synctest ───────────────────────────────────────────
 
 func TestNewCallDoDeadlineExceededReturnsErrTimeOut(t *testing.T) {

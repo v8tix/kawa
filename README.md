@@ -25,6 +25,7 @@ Most HTTP clients make you choose between simplicity and power. kawa gives you b
 - [Request & Response Types](#request--response-types)
 - [Building Calls](#building-calls)
 - [Sync Execution — `Do`](#sync-execution--do)
+- [Sync Execution With Retry — `DoWithRetry`](#sync-execution-with-retry--dowithretry)
 - [Reactive Execution — `Observable`](#reactive-execution--observable)
 - [Retry Policy](#retry-policy)
 - [Error Policy](#error-policy)
@@ -207,6 +208,31 @@ raw, _ := io.ReadAll(env.Response.Body)
 ```
 
 > `env.Response.Body` is replaced with a re-readable `io.NopCloser` over the buffered bytes, so you can inspect it after the network connection is already closed.
+
+---
+
+## Sync Execution With Retry — `DoWithRetry`
+
+`Do` never retries — it's a single-shot call. Retry only exists on the `Observable` path, which requires unpacking an `rxgo.Item` even if you don't want reactive composition. `DoWithRetry` is that unpacking done for you: `Do`'s call shape, `Observable`'s retry/backoff.
+
+```go
+env, err := createUser.WithRetryPolicy(kawa.NewExponentialRetryPolicy(3, 200*time.Millisecond)).
+    DoWithRetry(ctx, &req)
+if err != nil {
+    // See "Error Types" below for what err can be
+}
+
+fmt.Println(env.Body.ID)
+```
+
+Equivalent to:
+
+```go
+item := <-createUser.Observable(ctx, &req).Observe()
+env, err := kawa.ItemValue[Envelope[UserRes]](item)
+```
+
+Use `Do` when you don't want retry at all. Use `DoWithRetry` for the common case: synchronous call, retry on transient failure, no RxGo composition needed. Use `Observable` directly when you need fan-out, merge, or pipelining.
 
 ---
 

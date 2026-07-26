@@ -134,3 +134,11 @@ func (c *HTTPCall[T, U]) Observable(ctx context.Context, request *T) rxgo.Observ
 	)
 	return obs.BackOffRetry(bo)
 }
+
+// DoWithRetry executes call synchronously with the configured RetryPolicy and
+// ErrorPolicy applied — Do wrapped in Observable's retry/backoff, without
+// exposing RxGo to the caller.
+func (c *HTTPCall[T, U]) DoWithRetry(ctx context.Context, request *T) (*Envelope[U], error) {
+	item := <-c.Observable(ctx, request).Observe()
+	return ItemValue[Envelope[U]](item)
+}
