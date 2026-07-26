@@ -7,7 +7,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/reactivex/rxgo/v2 v2.5.0
 	github.com/samber/lo v1.53.0
-	github.com/v8tix/jsonx v1.0.0
+	github.com/v8tix/jsonx v1.0.1
 )
 
 require (
@@ -19,6 +19,6 @@ require (
 	github.com/stretchr/objx v0.5.3 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/teivah/onecontext v1.3.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
