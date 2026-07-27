@@ -393,7 +393,7 @@ Wrap any error with `kawa.Permanent(err)` to stop the retry loop immediately, re
 
 | Sentinel / type | When returned |
 |---|---|
-| `ErrTimeOut` | The **per-request deadline** (`WithDeadline`) fired before the server responded. Distinct from a caller-cancelled context. |
+| `ErrTimeOut` | The **per-request deadline** (`WithDeadline`) fired — either before the server responded, or while its response body was still being read. Distinct from a caller-cancelled context. |
 | `ErrInvalidHTTPStatus` | Server replied with a 4xx or 5xx. Carries `.StatusCode`, `.Status`, and `.Body` (up to `WithErrorBodyLimit`). |
 | `ErrMarshalValue` | Request body could not be marshalled to JSON. |
 | `ErrNilValue` | A non-nil pointer was required but `nil` was passed. |
@@ -561,6 +561,13 @@ Tests are split into two layers:
 | `TestItemValueWithNilValueAndErrorReturnsError` | `item.E` is returned directly when `item.V` is nil. |
 | `TestItemValueWithWrongTypeReturnsErrNonPointer` | Type mismatch between the generic parameter and the item value returns `ErrNonPointerOrWrongCasting`. |
 | `TestExecuteBodyIOFailures` | I/O errors on response body read/close are surfaced correctly; original body is always closed. |
+| `TestNewCallDoLargeResponseBodySucceeds` | `Do` succeeds against a large, multi-KB response body (a growing list, not a single object). |
+| `TestNewCallDoWithRetryLargeResponseBodySucceeds` | `DoWithRetry` succeeds against the same large-body shape. |
+| `TestNewCallDoDeadlineExceededDuringBodyReadReturnsErrTimeOut` | `WithDeadline` firing mid-body-stream (not just before headers) still translates to `ErrTimeOut`, not a raw context error. |
+| `TestNewCallDoCallerCancelDuringBodyReadReturnsContextDeadlineExceeded` | A caller-driven cancellation mid-body-read surfaces as the caller's own context error, not `ErrTimeOut`. |
+| `TestNewCallDoWithRetryLargeResponseBodyAfterTransientTimeoutSucceeds` | A timed-out first attempt followed by a fast large-body second attempt succeeds — retries don't leak release/timer state across attempts. |
+| `TestEnvelopeResponseBodyIsReadableAfterDoWithLargeBody` | `env.Response.Body` remains independently re-readable after `Do` for large payloads too. |
+| `TestHTTPCallDoConcurrentCallsWithLargeBodiesDoNotRace` | Concurrent `Do` calls with large response bodies share no mutable state (race-detector clean). |
 
 ### `tests/retry` — Retry and error policy
 
