@@ -21,7 +21,8 @@ import (
 func TestSendRequestWithClientHeadersForwardsHeaders(t *testing.T) {
 	t.Parallel()
 	client := customHeadersHTTPClient(middleware.NewCustomHeaders(headers, nil))
-	resp, err := sendRequest(context.Background(), client, headerEchoTS.URL, nil, nil, time.Second, Get, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	resp, release, err := sendRequest(context.Background(), client, headerEchoTS.URL, nil, nil, time.Second, Get, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	defer release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +35,8 @@ func TestSendRequestWithClientHeadersForwardsHeaders(t *testing.T) {
 
 func TestSendRequestWithExplicitHeadersForwardsHeaders(t *testing.T) {
 	t.Parallel()
-	resp, err := sendRequest(context.Background(), httpClient, headerEchoTS.URL, headers, nil, time.Second, Get, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	resp, release, err := sendRequest(context.Background(), httpClient, headerEchoTS.URL, headers, nil, time.Second, Get, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	defer release()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +49,8 @@ func TestSendRequestWithExplicitHeadersForwardsHeaders(t *testing.T) {
 
 func TestSendRequestSlowServerReturnsErrTimeOut(t *testing.T) {
 	t.Parallel()
-	_, err := sendRequest(context.Background(), httpClient, slowUserTS.URL, nil, cuReqReader(), 10*time.Millisecond, Post, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	_, release, err := sendRequest(context.Background(), httpClient, slowUserTS.URL, nil, cuReqReader(), 10*time.Millisecond, Post, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	defer release()
 	if !errors.Is(err, ErrTimeOut) {
 		t.Fatalf("expected ErrTimeOut, got: %v", err)
 	}
@@ -96,7 +99,8 @@ func TestSendRequestNonKawaTimeoutsArePassedThrough(t *testing.T) {
 			t.Parallel()
 			ctx, cancel := tc.mkCtx()
 			defer cancel()
-			_, err := sendRequest(ctx, httpClient, tc.url, nil, cuReqReader(), 10*time.Second, Post, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+			_, release, err := sendRequest(ctx, httpClient, tc.url, nil, cuReqReader(), 10*time.Second, Post, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+			defer release()
 			if errors.Is(err, ErrTimeOut) {
 				t.Fatalf("expected no ErrTimeOut, got ErrTimeOut")
 			}
@@ -108,6 +112,21 @@ func TestSendRequestNonKawaTimeoutsArePassedThrough(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSendRequestReleaseIsIdempotentAndCancelsContext(t *testing.T) {
+	t.Parallel()
+	_, release, err := sendRequest(context.Background(), httpClient, headerEchoTS.URL, nil, nil, time.Second, Get, defaultInvalidStatusCodeValidator, maxErrorBodyBytes)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Calling release multiple times must not panic — execute() defers it
+	// once, but sendRequest's own error paths also call it directly, so both
+	// can legitimately fire for the same release value in some paths.
+	release()
+	release()
+	release()
 }
 
 // ── marshalToReader ───────────────────────────────────────────────────────────

@@ -161,12 +161,16 @@ func defaultInvalidStatusCodeValidator(response *http.Response) bool {
 }
 
 // sanitizeURL returns scheme+host+path only, stripping query and fragment to
-// avoid leaking auth tokens or other sensitive query parameters in error messages.
-func sanitizeURL(u *url.URL) string {
-	safe := *u
-	safe.RawQuery = ""
-	safe.Fragment = ""
-	return safe.String()
+// avoid leaking auth tokens or other sensitive query parameters in error
+// messages. Falls back to the raw string if it doesn't parse as a URL.
+func sanitizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 func execute[T Req, U Res](
@@ -189,10 +193,17 @@ func execute[T Req, U Res](
 		bodyReader = reader
 	}
 
-	httpResponse, err := sendRequest(ctx, client, endpoint, cfg.Headers, bodyReader, cfg.Deadline, method, defaultInvalidStatusCodeValidator, cfg.ErrorBodyLimit)
+	httpResponse, release, err := sendRequest(ctx, client, endpoint, cfg.Headers, bodyReader, cfg.Deadline, method, defaultInvalidStatusCodeValidator, cfg.ErrorBodyLimit)
 	if err != nil {
 		return nil, err
 	}
+	// release cancels the request context and stops the deadline timer. It must
+	// stay live until the body is fully read below — sendRequest used to cancel
+	// it the moment the round-trip finished, before the body (read here) had
+	// been consumed. Small bodies are already fully buffered by then and never
+	// noticed; a large one isn't, and the read raced an already-canceled
+	// context and failed with "context canceled" every time.
+	defer release()
 	// Capture original body before we potentially replace it below, so the defer
 	// always closes the underlying network connection — not a NopCloser over bytes.
 	originalBody := httpResponse.Body
@@ -211,6 +222,7 @@ func execute[T Req, U Res](
 	//   2. Restore it on Envelope.Response.Body for callers who need the raw bytes.
 	rawBody, err := io.ReadAll(io.LimitReader(httpResponse.Body, cfg.BodyLimit))
 	if err != nil {
+		err = wrapIfOwnTimeout(err, ctx, endpoint)
 		return nil, err
 	}
 
@@ -228,6 +240,33 @@ func newResponse[T Res](body *T, res *http.Response) *Envelope[T] {
 	return &Envelope[T]{Body: body, Response: res}
 }
 
+// wrapIfOwnTimeout distinguishes our own timer-induced cancellation from a
+// deliberate caller cancellation, translating the former into the friendly
+// ErrTimeOut. Our timer fires cancel() on a context derived from ctx but
+// leaves ctx itself untouched, so ctx.Err() == nil exactly when our timer
+// fired rather than the caller's own context expiring or being canceled.
+//
+// Applies to errors from both phases that share the same request context:
+// the round-trip itself (wrapped in *url.Error by net/http) and the body
+// read that happens afterward (returned bare, not *url.Error-wrapped). rawURL
+// is the original request target, not *http.Request.URL — a response from a
+// hand-built or test RoundTripper may have no associated Request at all.
+func wrapIfOwnTimeout(err error, ctx context.Context, rawURL string) error {
+	isCancellation := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
+		isCancellation = errors.Is(urlErr.Err, context.Canceled) || errors.Is(urlErr.Err, context.DeadlineExceeded)
+	}
+	if isCancellation && ctx.Err() == nil {
+		return fmt.Errorf("service at %q %w", sanitizeURL(rawURL), ErrTimeOut)
+	}
+	return err
+}
+
+// sendRequest performs the round-trip and returns a release func the caller
+// must invoke once fully done with the response — including reading its
+// body. release cancels the request context and stops the deadline timer;
+// on every error path here the response (if any) is already fully consumed,
+// so release is safe to call immediately in those cases.
 func sendRequest(
 	ctx context.Context,
 	client *http.Client,
@@ -238,43 +277,38 @@ func sendRequest(
 	method HTTPMethod,
 	statusCodeValidator func(res *http.Response) bool,
 	errorBodyLimit int64,
-) (*http.Response, error) {
+) (res *http.Response, release func(), err error) {
 	withCancelCtx, cancel := context.WithCancel(ctx)
-	defer cancel() // always release the child context; calling cancel twice is safe
 	timer := time.AfterFunc(deadline, cancel)
-	defer func() {
+	release = func() {
+		cancel() // always release the child context; calling cancel twice is safe
 		if !timer.Stop() {
 			select {
 			case <-timer.C:
 			default:
 			}
 		}
-	}()
+	}
 
 	request, err := http.NewRequestWithContext(withCancelCtx, string(method), rawURL, body)
 	if err != nil {
-		return nil, err
+		release()
+		return nil, release, err
 	}
 	for k, v := range headers {
 		request.Header.Add(k, v)
 	}
 
-	res, err := client.Do(request)
+	httpRes, err := client.Do(request)
 	if err != nil {
-		// Distinguish our own timer-induced cancellation from a deliberate caller
-		// cancellation. Our timer fires cancel() on withCancelCtx but leaves the
-		// parent ctx untouched, so ctx.Err() == nil exactly when our timer fired.
-		if urlErr, ok := errors.AsType[*url.Error](err); ok &&
-			(errors.Is(urlErr.Err, context.Canceled) || errors.Is(urlErr.Err, context.DeadlineExceeded)) &&
-			ctx.Err() == nil {
-			return nil, fmt.Errorf("service at %q %w", sanitizeURL(request.URL), ErrTimeOut)
-		}
-		return nil, err
+		release()
+		return nil, release, wrapIfOwnTimeout(err, ctx, rawURL)
 	}
-	if statusCodeValidator(res) {
-		return nil, newErrInvalidHTTPStatus(res, errorBodyLimit)
+	if statusCodeValidator(httpRes) {
+		release()
+		return nil, release, newErrInvalidHTTPStatus(httpRes, errorBodyLimit)
 	}
-	return res, nil
+	return httpRes, release, nil
 }
 
 func marshalToReader[T any](value *T) (*bytes.Reader, error) {

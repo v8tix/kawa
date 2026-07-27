@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -231,6 +232,161 @@ func TestNewCallDoDeadlineExceededReturnsErrTimeOut(t *testing.T) {
 			t.Errorf("expected ErrTimeOut, got: %v", err)
 		}
 	})
+}
+
+// ── large response bodies ─────────────────────────────────────────────────────
+
+// TestNewCallDoLargeResponseBodySucceeds reproduces a bug where sendRequest
+// deferred cancel() on its own request context the moment it returned —
+// before execute() had read the response body. Small bodies are already
+// fully buffered by the time client.Do() returns, so the premature
+// cancellation went unnoticed; a genuinely large body (like a full list
+// endpoint) isn't, so the later read raced an already-canceled context and
+// failed with "context canceled" — deterministically, not just under load.
+func TestNewCallDoLargeResponseBodySucceeds(t *testing.T) {
+	t.Parallel()
+	env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, manyUsersTS.URL).
+		WithDeadline(5*time.Second).
+		Do(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Do: unexpected error for large response body: %v", err)
+	}
+	if got := len(env.Body.Users); got != 5000 {
+		t.Errorf("expected 5000 users, got %d", got)
+	}
+}
+
+func TestNewCallDoWithRetryLargeResponseBodySucceeds(t *testing.T) {
+	t.Parallel()
+	env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, manyUsersTS.URL).
+		WithDeadline(5*time.Second).
+		WithMaxRetries(0).
+		DoWithRetry(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("DoWithRetry: unexpected error for large response body: %v", err)
+	}
+	if got := len(env.Body.Users); got != 5000 {
+		t.Errorf("expected 5000 users, got %d", got)
+	}
+}
+
+// A deadline that fires while the body is still streaming (not just before
+// headers arrive) must still translate to the friendly ErrTimeOut, not leak
+// as a raw "context canceled" — proving the widened cancel scope (now
+// covering the body read) still correctly distinguishes "our own timer
+// fired" from any other cancellation source.
+func TestNewCallDoDeadlineExceededDuringBodyReadReturnsErrTimeOut(t *testing.T) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(slowStreamingBodyHandler))
+	defer ts.Close()
+
+	_, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
+		WithDeadline(50*time.Millisecond).
+		Do(context.Background(), nil)
+	if !errors.Is(err, kawa.ErrTimeOut) {
+		t.Fatalf("expected ErrTimeOut, got: %v", err)
+	}
+}
+
+// A caller-driven cancellation mid-body-read must still surface as the
+// caller's own context error (not be mistaken for our own timer, and not be
+// masked by the wider release scope now covering the read).
+func TestNewCallDoCallerCancelDuringBodyReadReturnsContextDeadlineExceeded(t *testing.T) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(slowStreamingBodyHandler))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
+		WithDeadline(5*time.Second).
+		Do(ctx, nil)
+	if errors.Is(err, kawa.ErrTimeOut) {
+		t.Fatalf("expected caller's own context error, not ErrTimeOut: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got: %v", err)
+	}
+}
+
+// Retries must not leak release/timer state across attempts — a slow first
+// attempt that times out, followed by a fast large-body second attempt,
+// must succeed cleanly.
+func TestNewCallDoWithRetryLargeResponseBodyAfterTransientTimeoutSucceeds(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			slowStreamingBodyHandler(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, envelope{"users": manyUsers(3000)})
+	}))
+	defer ts.Close()
+
+	env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
+		WithDeadline(50*time.Millisecond).
+		WithRetryPolicy(zeroBackOffPolicy{n: 1}).
+		DoWithRetry(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error after retry: %v", err)
+	}
+	if got := len(env.Body.Users); got != 3000 {
+		t.Errorf("expected 3000 users, got %d", got)
+	}
+	if got := int(attempts.Load()); got != 2 {
+		t.Errorf("expected 2 attempts, got %d", got)
+	}
+}
+
+// Envelope.Response.Body must still be independently re-readable after Do
+// for large payloads too, not just the small ones the original test covers.
+func TestEnvelopeResponseBodyIsReadableAfterDoWithLargeBody(t *testing.T) {
+	t.Parallel()
+	env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, manyUsersTS.URL).
+		WithDeadline(5*time.Second).
+		Do(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	raw, err := io.ReadAll(env.Response.Body)
+	if err != nil {
+		t.Fatalf("Envelope.Response.Body read failed: %v", err)
+	}
+	var reparsed manyUsersEnvV1Res
+	if err := json.Unmarshal(raw, &reparsed); err != nil {
+		t.Fatalf("raw body did not re-parse as valid JSON: %v", err)
+	}
+	if len(reparsed.Users) != 5000 {
+		t.Errorf("expected 5000 users in re-read raw body, got %d", len(reparsed.Users))
+	}
+}
+
+// Concurrent large-body calls must not race or leak resources under the new
+// release mechanism.
+func TestHTTPCallDoConcurrentCallsWithLargeBodiesDoNotRace(t *testing.T) {
+	t.Parallel()
+	call := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, manyUsersTS.URL).
+		WithDeadline(5 * time.Second)
+
+	const goroutines = 10
+	errc := make(chan error, goroutines)
+	for range goroutines {
+		go func() {
+			env, err := call.Do(context.Background(), nil)
+			if err == nil && len(env.Body.Users) != 5000 {
+				err = fmt.Errorf("expected 5000 users, got %d", len(env.Body.Users))
+			}
+			errc <- err
+		}()
+	}
+	for range goroutines {
+		if err := <-errc; err != nil {
+			t.Errorf("unexpected error in concurrent Do: %v", err)
+		}
+	}
 }
 
 // ── multi-method coverage ─────────────────────────────────────────────────────
