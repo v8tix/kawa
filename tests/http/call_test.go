@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/reactivex/rxgo/v2"
+	"github.com/v8tix/rxgo/v2"
 
 	"github.com/v8tix/kawa"
 )
@@ -312,33 +313,40 @@ func TestNewCallDoCallerCancelDuringBodyReadReturnsContextDeadlineExceeded(t *te
 
 // Retries must not leak release/timer state across attempts — a slow first
 // attempt that times out, followed by a fast large-body second attempt,
-// must succeed cleanly.
+// must succeed cleanly. Driven entirely by a fake transport inside a
+// synctest bubble (no real server, no real sleep) so the outcome depends on
+// the retry logic alone, never on wall-clock scheduling noise.
 func TestNewCallDoWithRetryLargeResponseBodyAfterTransientTimeoutSucceeds(t *testing.T) {
 	t.Parallel()
-
-	var attempts atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if attempts.Add(1) == 1 {
-			slowStreamingBodyHandler(w, r)
-			return
+	synctest.Test(t, func(t *testing.T) {
+		body, err := json.Marshal(envelope{"users": manyUsers(3000)})
+		if err != nil {
+			t.Fatalf("marshal fixture body: %v", err)
 		}
-		writeJSON(w, http.StatusOK, envelope{"users": manyUsers(3000)})
-	}))
-	defer ts.Close()
 
-	env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](newTestHTTPClient(), kawa.Get, ts.URL).
-		WithDeadline(50*time.Millisecond).
-		WithRetryPolicy(zeroBackOffPolicy{n: 1}).
-		DoWithRetry(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("unexpected error after retry: %v", err)
-	}
-	if got := len(env.Body.Users); got != 3000 {
-		t.Errorf("expected 3000 users, got %d", got)
-	}
-	if got := int(attempts.Load()); got != 2 {
-		t.Errorf("expected 2 attempts, got %d", got)
-	}
+		var attempts atomic.Int32
+		client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if attempts.Add(1) == 1 {
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			}
+			return fakeResponse(http.StatusOK, io.NopCloser(bytes.NewReader(body))), nil
+		})}
+
+		env, err := kawa.NewCall[kawa.NoReq, manyUsersEnvV1Res](client, kawa.Get, "http://fake.local/").
+			WithDeadline(50*time.Millisecond).
+			WithRetryPolicy(zeroBackOffPolicy{n: 1}).
+			DoWithRetry(context.Background(), nil)
+		if err != nil {
+			t.Fatalf("unexpected error after retry: %v", err)
+		}
+		if got := len(env.Body.Users); got != 3000 {
+			t.Errorf("expected 3000 users, got %d", got)
+		}
+		if got := int(attempts.Load()); got != 2 {
+			t.Errorf("expected 2 attempts, got %d", got)
+		}
+	})
 }
 
 // Envelope.Response.Body must still be independently re-readable after Do
@@ -622,7 +630,7 @@ func TestExecuteBodyIOFailures(t *testing.T) {
 			transport: func(r *http.Request) (*http.Response, error) {
 				rec := httptest.NewRecorder()
 				rec.WriteHeader(http.StatusOK)
-				fmt.Fprint(rec, validBody)
+				_, _ = fmt.Fprint(rec, validBody)
 				resp := rec.Result()
 				resp.Body = readCloser{Reader: resp.Body, closeErr: closeErr}
 				return resp, nil

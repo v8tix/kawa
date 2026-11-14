@@ -41,10 +41,6 @@ type (
 		SmsNumber string `json:"sms_number,omitempty"`
 		Enabled   bool   `json:"enabled,omitempty"`
 	}
-
-	getUserEnvV1Res struct {
-		User getUserV1Res `json:"user"`
-	}
 )
 
 func (n *nonSerdeType) UnmarshalJSON(_ []byte) error { return errors.New("non-serde struct") }

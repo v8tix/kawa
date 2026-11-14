@@ -137,12 +137,12 @@ func notFoundHandler(w http.ResponseWriter, _ *http.Request) {
 func largeBodyHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `{"user":{"name":"Marco","sms_number":"123","enabled":false}}`)
+	_, _ = fmt.Fprint(w, `{"user":{"name":"Marco","sms_number":"123","enabled":false}}`)
 }
 
 func badRequestBodyHandler(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusBadRequest)
-	fmt.Fprint(w, `{"message":"this is a long error message that exceeds the limit"}`)
+	_, _ = fmt.Fprint(w, `{"message":"this is a long error message that exceeds the limit"}`)
 }
 
 // manyUsersHandler writes a genuinely large response (unlike largeBodyTS,
@@ -171,12 +171,12 @@ func manyUsers(n int) []getUserV1Res {
 func slowStreamingBodyHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `{"users":[`)
+	_, _ = fmt.Fprint(w, `{"users":[`)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 	time.Sleep(200 * time.Millisecond)
-	fmt.Fprint(w, `]}`)
+	_, _ = fmt.Fprint(w, `]}`)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data envelope) {
