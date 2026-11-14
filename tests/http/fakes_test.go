@@ -3,7 +3,6 @@ package tests
 import (
 	"io"
 	"net/http"
-	"net/http/httptest"
 )
 
 // ── functional fakes ──────────────────────────────────────────────────────────
@@ -46,13 +45,4 @@ type blockingTransport struct{}
 func (blockingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	<-r.Context().Done()
 	return nil, r.Context().Err()
-}
-
-// okTransport returns a RoundTripper that always responds with 200 OK.
-func okTransport() http.RoundTripper {
-	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		rec := httptest.NewRecorder()
-		rec.WriteHeader(http.StatusOK)
-		return rec.Result(), nil
-	})
 }
